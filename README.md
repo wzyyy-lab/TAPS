@@ -246,6 +246,21 @@ All numbers below use the same target model, draft model, held-out prompts, `shu
 
 TAPS64 verifies 64 nodes on average from a 512-node candidate pool, with an average of 32.97 selected sequences and no DDTree fallback in the reported run.
 
+### Relative comparison
+
+| Dataset | vs DDTree512 Tok/s | vs DDTree512 Accept | vs DFlash Tok/s | vs DFlash Accept |
+|---|---:|---:|---:|---:|
+| Overall | **+125.1%** | -9.1% | **+60.7%** | **+31.7%** |
+| `aime25` | **+126.1%** | -10.0% | **+49.7%** | **+26.3%** |
+| `gsm8k` | **+123.7%** | -8.6% | **+55.1%** | **+31.7%** |
+| `humaneval` | **+128.1%** | -8.9% | **+57.9%** | **+32.9%** |
+| `livecodebench` | **+128.7%** | -9.3% | **+50.2%** | **+27.5%** |
+| `math500` | **+109.4%** | -7.0% | **+41.6%** | **+27.6%** |
+| `mbpp` | **+120.3%** | -9.7% | **+64.7%** | **+36.8%** |
+| `mt-bench` | **+123.2%** | -12.0% | **+70.4%** | **+38.0%** |
+
+TAPS64 achieves 2.25x the throughput of DDTree512 with a 9.1% acceptance length trade-off, and 1.61x the throughput of DFlash while also improving acceptance length by 31.7%.
+
 ## Acknowledgements
 
 TAPS builds on the DDTree and DFlash speculative decoding code paths. The baseline commands above are kept in this repository so that TAPS, DDTree, and DFlash can be evaluated under the same prompt selection and timing setup.
