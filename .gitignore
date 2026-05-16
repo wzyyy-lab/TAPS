@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Outputs and checkpoints
+outputs/
+runs/
+logs/
+*.pt
+*.npy
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Environment
+.venv/
+venv/
+
+# Backup files
+*.orig
+
+# Internal dev notes
+plan.md
+taps_v2_root_causes.md
+SERVER_RUNBOOK.md
+
+# Local profiling scripts
+scripts/compare_both.py
+scripts/run_compare_both.sh
+scripts/profile_*.sh
+scripts/profile_overhead.py
+scripts/profile_overhead_v2.sh
+
+# HuggingFace assets cache
+hf_assets/
