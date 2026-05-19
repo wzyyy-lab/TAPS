@@ -150,21 +150,22 @@ def build_edge_feature_batch(
     )
 
 
-def propagate_reach(trie: CandidateTrie, q_cond: torch.Tensor) -> torch.Tensor:
+def propagate_reach(trie: CandidateTrie, q_cond: torch.Tensor, max_depth: int) -> torch.Tensor:
+    """Propagate acceptance probability from root through the trie.
+
+    Fully GPU — zero CPU↔GPU synchronization.  Uses iterative relaxation:
+    each iteration correctly resolves one more depth level, so after
+    *max_depth* iterations every node has its final reach value.
+    """
     q_reach = torch.zeros((trie.num_total_nodes,), dtype=q_cond.dtype, device=trie.device)
     q_reach[0] = 1.0
     if trie.num_nodes == 0:
         return q_reach
-    max_depth = int(trie.depths.max().item())
-    node_ids = torch.arange(1, trie.num_total_nodes, dtype=torch.long, device=trie.device)
-    for depth in range(1, max_depth + 1):
-        edge_mask = trie.depths == depth
-        if not edge_mask.any():
-            continue
-        current_nodes = node_ids[edge_mask]
-        parents = trie.parents[current_nodes]
-        q_reach[current_nodes] = q_reach.gather(0, parents) * q_cond[edge_mask]
-    return torch.minimum(q_reach, torch.ones_like(q_reach))
+    parents_nonroot = trie.parents[1:]
+    for _ in range(max_depth):
+        q_reach[1:] = q_reach.gather(0, parents_nonroot) * q_cond
+    q_reach.clamp_(max=1.0)
+    return q_reach
 
 
 def build_ancestor_matrix(parents: torch.Tensor, max_depth: int | None = None) -> torch.Tensor:
@@ -199,42 +200,54 @@ def _closure_mask_from_ranked_nodes(
     if ranked_old_node_ids.numel() == 0 or max_nonroot_nodes <= 0 or endpoint_limit <= 0:
         return selected
 
-    ancestors = build_ancestor_matrix(parents, max_depth=max_depth)
+    # --- GPU: vectorized ancestor chain computation ---
+    # Walk parent chains for ALL ranked nodes simultaneously via gather,
+    # replacing per-node Python while-loop + parents.cpu().tolist().
+    parent_for_gather = parents.clamp_min(0)
+    current = ranked_old_node_ids
+    chains = [current]
+    for _ in range(max_depth):
+        current = parent_for_gather.gather(0, current)
+        chains.append(current)
+    ancestor_matrix = torch.stack(chains, dim=1)  # [num_ranked, max_depth+1]
 
-    # Pre-fetch ancestor closures to CPU for fast iteration (single GPU→CPU transfer)
-    ranked_list = ranked_old_node_ids.detach().cpu().tolist()
-    ancestors_for_ranked = ancestors[ranked_old_node_ids].cpu()  # (num_ranked, max_depth+1)
+    # --- Single bulk transfer to CPU ---
+    ancestors_cpu = ancestor_matrix.cpu().tolist()
 
-    # Work on CPU to avoid per-iteration GPU syncs
-    selected_cpu = selected.cpu()
+    # --- CPU: build closures from ancestor rows ---
+    ancestor_closures: list[set[int]] = []
+    for row in ancestors_cpu:
+        ancestor_closures.append({x for x in row if x != 0})
+
+    # --- CPU: greedy selection (sequential, optimal for this size) ---
+    selected_set: set[int] = set()
     endpoints = 0
-    for idx in range(len(ranked_list)):
-        closure = ancestors_for_ranked[idx]
-        candidate = selected_cpu.clone()
-        candidate[closure] = True
-        candidate[0] = True
-        count = int(candidate[1:].sum().item())
-        current_count = int(selected_cpu[1:].sum().item())
-        if count > max_nonroot_nodes or count == current_count:
+    for idx in range(len(ancestor_closures)):
+        closure = ancestor_closures[idx]
+        candidate = selected_set | closure
+        count = len(candidate)
+        if count > max_nonroot_nodes or count == len(selected_set):
             continue
-        selected_cpu = candidate
+        selected_set = candidate
         endpoints += 1
         if count >= max_nonroot_nodes or endpoints >= endpoint_limit:
             break
 
-    if int(selected_cpu[1:].sum().item()) < min_nonroot_nodes:
-        for idx in range(len(ranked_list)):
-            closure = ancestors_for_ranked[idx]
-            candidate = selected_cpu.clone()
-            candidate[closure] = True
-            candidate[0] = True
-            count = int(candidate[1:].sum().item())
+    if len(selected_set) < min_nonroot_nodes:
+        for idx in range(len(ancestor_closures)):
+            closure = ancestor_closures[idx]
+            candidate = selected_set | closure
+            count = len(candidate)
             if count <= max_nonroot_nodes:
-                selected_cpu = candidate
-            if int(selected_cpu[1:].sum().item()) >= min_nonroot_nodes:
+                selected_set = candidate
+            if len(selected_set) >= min_nonroot_nodes:
                 break
 
-    return selected_cpu.to(device=device)
+    # --- Single transfer back to GPU ---
+    if selected_set:
+        idx_tensor = torch.tensor(sorted(selected_set), dtype=torch.long, device=device)
+        selected[idx_tensor] = True
+    return selected
 
 
 def _leaf_count(parents: torch.Tensor) -> int:
@@ -250,6 +263,7 @@ def _select_prefix_closed(
     q_reach: torch.Tensor,
     config: JointDDTConfig,
     prompt_length: int,
+    max_depth: int,
 ) -> torch.Tensor:
     device = trie.device
     selected = torch.zeros((trie.num_total_nodes,), dtype=torch.bool, device=device)
@@ -274,9 +288,6 @@ def _select_prefix_closed(
         valid = torch.ones_like(valid)
     valid_indices = valid.nonzero(as_tuple=False).flatten()
     valid_utility = utility[valid_indices]
-    # Treat ranked nodes as sequence endpoints. Taking at most max_verify_sequences
-    # endpoints keeps the selected trie from turning into a wide leaf set while
-    # ancestor closure still lets shared prefixes consume the node budget.
     endpoint_cap = max(1, int(config.max_verify_sequences))
     endpoint_floor = min(endpoint_cap, max(1, int(config.min_verify_sequences)))
     candidate_take = min(
@@ -284,7 +295,6 @@ def _select_prefix_closed(
         max(endpoint_floor, endpoint_cap * int(config.selection_top_multiplier)),
     )
     order = valid_indices[torch.topk(valid_utility, k=candidate_take, largest=True).indices] + 1
-    max_depth = int(trie.depths.max().item()) if trie.depths.numel() else 1
     selected_with_root = _closure_mask_from_ranked_nodes(
         order,
         trie.parents,
@@ -324,7 +334,7 @@ def score_candidate_trie(
     edge_logits, other_logits = apply_logit_calibration(edge_logits, other_logits, trie.depths, calibration)
     if trie.num_nodes > 0:
         q_cond, q_other = grouped_softmax(edge_logits, trie.edge_parent_ids, other_logits)
-        q_reach = propagate_reach(trie, q_cond)
+        q_reach = propagate_reach(trie, q_cond, max_depth=lattice.horizon)
     else:
         q_cond = edge_logits.new_empty(0)
         q_other = other_logits.softmax(dim=0) if other_logits.numel() else edge_logits.new_empty(0)
@@ -372,11 +382,11 @@ def select_joint_tree(
     if calibration and float(calibration.get("confidence", 1.0)) < float(config.min_calibration_confidence):
         fallback_reason = fallback_reason or "low_calibration_confidence"
 
-    selected_mask = _select_prefix_closed(trie, q_reach, config, prompt_length=prompt_length)
+    selected_mask = _select_prefix_closed(trie, q_reach, config, prompt_length=prompt_length, max_depth=lattice.horizon)
     if int(selected_mask.sum().item()) < config.min_useful_verify_nodes:
         fallback_reason = fallback_reason or "below_min_useful_nodes"
 
-    selected_tree = compact_selected_trie(trie, selected_mask)
+    selected_tree = compact_selected_trie(trie, selected_mask, max_depth=lattice.horizon)
     metrics = {
         "candidate_nodes": trie.num_nodes,
         "selected_nodes": selected_tree.num_nodes,
@@ -401,10 +411,13 @@ def select_joint_tree(
 def select_marginal_tree(
     trie: CandidateTrie,
     config: JointDDTConfig,
+    max_depth: int | None = None,
 ) -> SelectedTree:
     selected = torch.zeros((trie.num_nodes,), dtype=torch.bool, device=trie.device)
     if trie.num_nodes == 0 or config.max_verify_nodes <= 0:
-        return compact_selected_trie(trie, selected)
+        return compact_selected_trie(trie, selected, max_depth=max_depth)
+    if max_depth is None:
+        max_depth = int(trie.depths.max().item()) if trie.depths.numel() else 1
     endpoint_cap = max(1, min(int(config.max_verify_sequences), trie.num_nodes))
     order = torch.argsort(trie.cum_log_probs, descending=True)[:endpoint_cap] + 1
     selected_with_root = _closure_mask_from_ranked_nodes(
@@ -412,8 +425,8 @@ def select_marginal_tree(
         trie.parents,
         max_nonroot_nodes=int(config.max_verify_nodes),
         min_nonroot_nodes=min(int(config.min_verify_nodes), int(config.max_verify_nodes), trie.num_nodes),
-        max_depth=int(trie.depths.max().item()) if trie.depths.numel() else 1,
+        max_depth=max_depth,
         max_endpoints=endpoint_cap,
     )
     selected = selected_with_root[1:]
-    return compact_selected_trie(trie, selected)
+    return compact_selected_trie(trie, selected, max_depth=max_depth)

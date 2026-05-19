@@ -25,10 +25,11 @@ def main() -> None:
     parser.add_argument("--tree-budget", type=str, default="16,32,64,128,256,512,1024")
     parser.add_argument("--proposal-mode", type=str, default="all", choices=["dflash", "ddtree", "joint", "ddtree_joint", "all"])
     parser.add_argument("--joint-checkpoint", type=str, default=None)
+    parser.add_argument("--tiny-scorer-checkpoint", type=str, default=None)
     parser.add_argument("--joint-topk", type=int, default=32)
     parser.add_argument("--candidate-pool-nodes", type=int, default=2048)
     parser.add_argument("--candidate-pool-sequences", type=int, default=256)
-    parser.add_argument("--candidate-pool-source", type=str, default="union", choices=["union", "ddtree_heap"])
+    parser.add_argument("--candidate-pool-source", type=str, default="union", choices=["union", "ddtree_heap", "taps_lite"])
     parser.add_argument("--min-verify-nodes", type=int, default=16)
     parser.add_argument("--max-verify-nodes", type=int, default=192)
     parser.add_argument("--min-verify-sequences", type=int, default=4)
@@ -93,12 +94,12 @@ def main() -> None:
         methods_to_run.extend(ddtree_method_keys)
         method_key_to_tree_budget.update({f"ddtree_tb{tree_budget}": tree_budget for tree_budget in tree_budgets})
     if args.proposal_mode in {"joint", "ddtree_joint"}:
-        if args.joint_checkpoint is None:
-            raise ValueError("--joint-checkpoint is required when --proposal-mode includes joint")
+        if args.joint_checkpoint is None and args.tiny_scorer_checkpoint is None:
+            raise ValueError("--joint-checkpoint or --tiny-scorer-checkpoint is required when --proposal-mode includes joint")
         if args.flash_attn:
             logger.warning("Joint-DDT uses custom tree masks; forcing the target verifier to torch.sdpa.")
         methods_to_run.append("joint")
-    elif args.proposal_mode == "all" and args.joint_checkpoint is not None:
+    elif args.proposal_mode == "all" and (args.joint_checkpoint is not None or args.tiny_scorer_checkpoint is not None):
         if args.flash_attn:
             logger.warning("Joint-DDT uses custom tree masks; forcing the target verifier to torch.sdpa.")
         methods_to_run.append("joint")
@@ -202,6 +203,7 @@ def main() -> None:
                 stop_token_ids=[tokenizer.eos_token_id],
                 temperature=args.temperature,
                 joint_checkpoint=args.joint_checkpoint,
+                tiny_scorer_checkpoint=args.tiny_scorer_checkpoint,
                 joint_config=joint_config,
             )
 
@@ -270,6 +272,7 @@ def main() -> None:
                         stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature,
                         joint_checkpoint=args.joint_checkpoint,
+                        tiny_scorer_checkpoint=args.tiny_scorer_checkpoint,
                         joint_config=joint_config,
                     )
 

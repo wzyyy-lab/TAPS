@@ -242,16 +242,30 @@ def _compact_appended_window(cache_tensor: torch.Tensor, past_length: int, keep_
     cache_tensor.narrow(-2, past_length, keep_count).copy_(kept_tail)
 
 
-def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_current_indices: list[int]) -> None:
-    if len(keep_current_indices) == 0:
-        past_key_values.crop(past_length)
-        return
+def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_current_indices: list[int] | torch.Tensor) -> None:
+    if isinstance(keep_current_indices, torch.Tensor):
+        if keep_current_indices.numel() == 0:
+            past_key_values.crop(past_length)
+            return
+        keep_count = keep_current_indices.numel()
+        prebuilt_tensor = keep_current_indices
+    else:
+        if len(keep_current_indices) == 0:
+            past_key_values.crop(past_length)
+            return
+        keep_count = len(keep_current_indices)
+        prebuilt_tensor = None
 
     keep_tensor_by_device: dict[torch.device, torch.Tensor] = {}
 
     def get_keep_tensor(device: torch.device) -> torch.Tensor:
         if device not in keep_tensor_by_device:
-            keep_tensor_by_device[device] = torch.tensor(keep_current_indices, dtype=torch.long, device=device)
+            if prebuilt_tensor is not None and prebuilt_tensor.device == device:
+                keep_tensor_by_device[device] = prebuilt_tensor
+            elif prebuilt_tensor is not None:
+                keep_tensor_by_device[device] = prebuilt_tensor.to(device)
+            else:
+                keep_tensor_by_device[device] = torch.tensor(keep_current_indices, dtype=torch.long, device=device)
         return keep_tensor_by_device[device]
 
     if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
@@ -261,7 +275,7 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
             keep_tensor = get_keep_tensor(key_cache.device)
             _compact_appended_window(key_cache, past_length, keep_tensor)
             _compact_appended_window(value_cache, past_length, keep_tensor)
-        past_key_values.crop(past_length + len(keep_current_indices))
+        past_key_values.crop(past_length + keep_count)
         return
 
     if hasattr(past_key_values, "layers"):
@@ -271,7 +285,7 @@ def compact_dynamic_cache(past_key_values: DynamicCache, past_length: int, keep_
             keep_tensor = get_keep_tensor(layer.keys.device)
             _compact_appended_window(layer.keys, past_length, keep_tensor)
             _compact_appended_window(layer.values, past_length, keep_tensor)
-        past_key_values.crop(past_length + len(keep_current_indices))
+        past_key_values.crop(past_length + keep_count)
         return
 
     raise RuntimeError("Unsupported DynamicCache layout for DDTree cache compaction.")
@@ -425,7 +439,7 @@ def ddtree_generate(
         output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
         output_ids[:, start + len(accepted_indices)] = next_token
 
-        compact_dynamic_cache(past_key_values_target, start, accepted_indices)
+        compact_dynamic_cache(past_key_values_target, start, accepted_index_tensor)
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids).index_select(1, accepted_index_tensor)
 
         acceptance_lengths.append(len(accepted_indices))

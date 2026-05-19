@@ -7,7 +7,8 @@ This repository includes:
 - DDTree and DFlash baselines.
 - Trace collection for training the TAPS node value model.
 - Node value model training and offline selector evaluation.
-- A shared benchmark entry point for TAPS, DDTree, and DFlash on identical prompts.
+- TAPS-Lite: a minimal-overhead variant using a 303-parameter TinyScorer with CPU beam search (~1.5ms scoring overhead per round).
+- A shared benchmark entry point for TAPS, TAPS-Lite, DDTree, and DFlash on identical prompts.
 
 ## Idea
 
@@ -18,7 +19,10 @@ For each decoding step, DDTree can produce many possible draft-tree nodes. Verif
 3. Select a bounded number of nodes and sequences for target-model verification.
 4. Accept tokens using the same verifier semantics as DDTree, but with a smaller verification budget.
 
-The main configuration used below is `TAPS64`: a DDTree candidate pool of 512 nodes with at most 64 verified nodes and 64 verified sequences.
+Two variants are provided:
+
+- **TAPS64**: uses the full node value model to score candidates from a 512-node pool, verifying at most 64 nodes and 64 sequences.
+- **TAPS-Lite**: uses a TinyScorer (7-feature → 32-hidden → 1 MLP, 303 parameters) that scores candidates from draft-model statistics only (log-probs, entropy, margin, topk mass). GPU scoring + single bulk transfer to CPU + numpy beam search keeps per-round overhead to ~1.5ms.
 
 ## Requirements
 
@@ -163,6 +167,25 @@ python scripts/62_eval_joint_selector.py \
   --output "$RUN_DIR/selector_eval.json"
 ```
 
+## Train TAPS-Lite
+
+TAPS-Lite replaces the full node value model with a TinyScorer — a 303-parameter MLP (7→32→1) that scores candidates using only draft-model statistics (log-probs, entropy, margin, topk mass, depth, rank). It uses the same trace data as TAPS.
+
+```bash
+python scripts/train_tiny_scorer.py \
+  --traces "$RUN_DIR/traces" \
+  --output "$RUN_DIR/tiny_scorer" \
+  --epochs 30 \
+  --lr 3e-3 \
+  --weight-decay 1e-4 \
+  --hidden-dim 32 \
+  --batch-size 512 \
+  --val-fraction 0.1 \
+  --seed 2026
+
+export TINY_CKPT="$RUN_DIR/tiny_scorer/best.pt"
+```
+
 ## Run Benchmarks
 
 The examples below run on one held-out `gsm8k` chunk. Use the same `--dataset`, `--sample-offset`, `--max-samples`, and `--shuffle-seed` for all methods when comparing them.
@@ -193,6 +216,33 @@ python benchmark.py \
   --no-fallback-to-ddtree \
   --fallback-backend none \
   --utility-threshold 0
+```
+
+Run TAPS-Lite:
+
+```bash
+python benchmark.py \
+  --model-name-or-path "$TARGET_MODEL" \
+  --draft-name-or-path "$DRAFT_MODEL" \
+  --dataset gsm8k \
+  --max-samples 16 \
+  --sample-offset 64 \
+  --shuffle-seed 2026 \
+  --max-new-tokens 512 \
+  --save-path "$RUN_DIR/taps_lite_gsm8k_offset64_n16.pt" \
+  --proposal-mode joint \
+  --tree-budget 512 \
+  --tiny-scorer-checkpoint "$TINY_CKPT" \
+  --joint-topk 64 \
+  --candidate-pool-nodes 768 \
+  --candidate-pool-sequences 48 \
+  --candidate-pool-source taps_lite \
+  --min-verify-nodes 16 \
+  --max-verify-nodes 64 \
+  --min-verify-sequences 4 \
+  --max-verify-sequences 64 \
+  --no-fallback-to-ddtree \
+  --fallback-backend none
 ```
 
 Run DDTree512:

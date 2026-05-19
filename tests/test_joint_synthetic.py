@@ -64,7 +64,7 @@ class JointSyntheticTests(unittest.TestCase):
         self.assertEqual(edge_logits.shape, (trie.num_nodes,))
         self.assertEqual(other_logits.shape, (trie.num_total_nodes,))
         q_cond, _ = grouped_softmax(edge_logits, trie.edge_parent_ids, other_logits)
-        q_reach = propagate_reach(trie, q_cond)
+        q_reach = propagate_reach(trie, q_cond, max_depth=lattice.horizon)
         self.assertEqual(q_reach.shape, (trie.num_total_nodes,))
         selection = select_joint_tree(trie, lattice, torch.tensor(1), model, config, prompt_length=4)
         self.assertLessEqual(selection.selected_tree.num_nodes, config.max_verify_nodes)

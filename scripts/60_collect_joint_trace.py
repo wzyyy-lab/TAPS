@@ -251,7 +251,7 @@ def collect_for_prompt(
         output_ids[:, start + len(accepted_indices)] = next_token
         from ddtree import compact_dynamic_cache
 
-        compact_dynamic_cache(past_key_values_target, start, accepted_indices)
+        compact_dynamic_cache(past_key_values_target, start, accepted_index_tensor)
         target_hidden = extract_context_feature(output.hidden_states, draft_model.target_layer_ids).index_select(1, accepted_index_tensor)
         start += len(accepted_indices)
         if eos_token_id is not None:

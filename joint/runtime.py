@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time as _time_mod
 from types import SimpleNamespace
 
 import torch
@@ -14,7 +15,8 @@ from .lattice import extract_topk_lattice
 from .model import NodeValueNet, load_node_value_net
 from .pool import build_ddtree_candidate_trie, build_marginal_candidate_trie, build_union_candidate_trie, value_token_scores_from_edges
 from .selector import score_candidate_trie, select_joint_tree, select_marginal_tree
-from .tree import compile_joint_tree, follow_tree_tensorized
+from .tiny_scorer import TinyScorer, compute_score_log_probs, load_tiny_scorer, taps_lite_select
+from .tree import compile_joint_tree, follow_tree_cpu, follow_tree_tensorized
 
 
 JOINT_STAGE_ORDER = (
@@ -63,7 +65,10 @@ def joint_ddtree_generate(
     joint_checkpoint: str | None = None,
     joint_model: NodeValueNet | None = None,
     joint_config: JointDDTConfig | None = None,
+    tiny_scorer_checkpoint: str | None = None,
+    tiny_scorer: TinyScorer | None = None,
     save_tree_traces: bool = False,
+    record_stage_times: bool = True,
 ) -> SimpleNamespace:
     if temperature >= 1e-5:
         raise ValueError("Joint-DDT v1 supports greedy target verification only: temperature must be 0.0")
@@ -81,8 +86,18 @@ def joint_ddtree_generate(
             temperature=temperature,
         )
 
-    if joint_model is None:
+    _is_taps_lite = joint_config is not None and joint_config.candidate_pool_source == "taps_lite"
+
+    if _is_taps_lite:
+        if tiny_scorer is None and tiny_scorer_checkpoint is not None:
+            tiny_scorer, _ = load_tiny_scorer(tiny_scorer_checkpoint, device=model.device)
+        if tiny_scorer is None:
+            raise ValueError("taps_lite mode requires --tiny-scorer-checkpoint or tiny_scorer argument")
+        joint_model = None
+        calibration = {}
+    elif joint_model is None:
         joint_model, checkpoint_config, payload = _load_joint_checkpoint(joint_checkpoint, model.device, target.dtype)
+        joint_model.eval()
         if joint_config is None:
             joint_config = checkpoint_config
         hidden_provenance = payload.get("hidden_provenance", {})
@@ -106,7 +121,8 @@ def joint_ddtree_generate(
     if joint_config is None:
         joint_config = JointDDTConfig()
     joint_config.validate()
-    joint_model.eval()
+
+    _timer = cuda_time if record_stage_times else _time_mod.perf_counter
 
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -155,7 +171,7 @@ def joint_ddtree_generate(
     time_to_first_token = cuda_time() - prefill_start
 
     decode_start = cuda_time()
-    round_clock_start = cuda_time()
+    round_clock_start = _timer()
     start = input_ids.shape[1]
     acceptance_lengths = []
     round_timestamps = []
@@ -164,11 +180,14 @@ def joint_ddtree_generate(
     previous_tree_start = 0
     previous_tree_length = 0
 
+    # Pre-allocate reusable buffer for accepted indices (avoids per-round GPU tensor creation)
+    _accepted_indices_buf = torch.empty(max_tree_nodes, dtype=torch.long, device=model.device)
+
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
         root_token = block_output_ids[:, :1]
 
-        draft_stage_start = cuda_time()
+        draft_stage_start = _timer()
         noise_embedding = target.model.embed_tokens(block_output_ids)
         draft_logits = target.lm_head(
             model(
@@ -181,112 +200,141 @@ def joint_ddtree_generate(
             )[:, -draft_horizon:, :]
         )
         past_key_values_draft.crop(start)
-        draft_stage_elapsed = cuda_time() - draft_stage_start
+        draft_stage_elapsed = _timer() - draft_stage_start
         if draft_prefill:
             draft_prefill = False
             decode_start = cuda_time()
         else:
             stage_times["draft"] += draft_stage_elapsed
 
-        lattice_start = cuda_time()
+        lattice_start = _timer()
         lattice = extract_topk_lattice(draft_logits[0], joint_config.joint_topk)
-        lattice_elapsed = cuda_time() - lattice_start
+        lattice_elapsed = _timer() - lattice_start
         stage_times["lattice"] += lattice_elapsed
 
-        context_hidden = None
-        if joint_model.context_hidden_dim > 0:
-            context_hidden = target_hidden[:, -1, :]
-            if context_hidden.shape[-1] != joint_model.context_hidden_dim:
-                raise ValueError(
-                    "Joint checkpoint context_hidden_dim does not match runtime target_hidden. "
-                    f"checkpoint={joint_model.context_hidden_dim}, runtime={context_hidden.shape[-1]}"
-                )
-
-        pool_start = cuda_time()
-        value_token_scores = None
-        seed_score_elapsed = 0.0
-        if joint_config.candidate_pool_source == "ddtree_heap":
-            candidate_trie = build_ddtree_candidate_trie(draft_logits[0], joint_config.candidate_pool_nodes)
-        else:
-            if joint_config.enable_value_beam_pool:
-                seed_nodes = max(1, int(joint_config.candidate_pool_nodes * min(joint_config.marginal_pool_fraction, 0.25)))
-                seed_trie = build_marginal_candidate_trie(lattice, joint_config, max_nodes=seed_nodes)
-                seed_score_start = cuda_time()
-                seed_scores = score_candidate_trie(
-                    seed_trie,
-                    lattice,
-                    root_token_id=root_token[0, 0],
-                    model=joint_model,
-                    config=joint_config,
-                    prompt_length=start,
-                    context_hidden=context_hidden,
-                    calibration=calibration,
-                )
-                value_token_scores = value_token_scores_from_edges(lattice, seed_trie, seed_scores.edge_logits)
-                seed_score_elapsed = cuda_time() - seed_score_start
-                stage_times["feature_mlp_select"] += seed_score_elapsed
-            candidate_trie = build_union_candidate_trie(lattice, joint_config, value_token_scores=value_token_scores)
-        pool_elapsed = max(0.0, cuda_time() - pool_start - seed_score_elapsed)
-        stage_times["pool"] += pool_elapsed
-
-        select_start = cuda_time()
-        selection = select_joint_tree(
-            candidate_trie,
-            lattice,
-            root_token_id=root_token[0, 0],
-            model=joint_model,
-            config=joint_config,
-            prompt_length=start,
-            context_hidden=context_hidden,
-            calibration=calibration,
-        )
-        selected_tree = selection.selected_tree
-        fallback_reason = selection.fallback_reason
-        select_elapsed = cuda_time() - select_start
-        stage_times["feature_mlp_select"] += select_elapsed
-
-        current_overhead = lattice_elapsed + pool_elapsed + seed_score_elapsed + select_elapsed
-        if ema_joint_overhead is None:
-            ema_joint_overhead = current_overhead
-        else:
-            ema_joint_overhead = 0.9 * ema_joint_overhead + 0.1 * current_overhead
-        if (
-            ema_verify_time is not None
-            and len(acceptance_lengths) >= int(joint_config.latency_gate_warmup_rounds)
-            and ema_joint_overhead > float(joint_config.max_pool_build_overhead_ratio) * ema_verify_time
-        ):
-            fallback_reason = fallback_reason or "latency_gate_small_tree"
-
-        completed_rounds = max(1, len(acceptance_lengths))
-        fallback_rate_so_far = sum(fallback_counts.values()) / completed_rounds
-        cpu_fallback_rate_allowed = fallback_rate_so_far <= float(joint_config.max_fallback_rate)
-        use_ddtree_fallback = bool(
-            fallback_reason
-            and joint_config.fallback_to_ddtree
-            and cpu_fallback_rate_allowed
-            and (joint_config.fallback_backend == "cpu_ddtree" or joint_config.debug_force_cpu_heap)
-        )
-        use_gpu_marginal_fallback = bool(
-            fallback_reason
-            and joint_config.fallback_to_ddtree
-            and not use_ddtree_fallback
-            and (
-                joint_config.fallback_backend == "gpu_marginal"
-                or (joint_config.fallback_backend == "cpu_ddtree" and not cpu_fallback_rate_allowed)
+        if _is_taps_lite:
+            lite_start = _timer()
+            selected_tree = taps_lite_select(
+                tiny_scorer, lattice,
+                max_pool_nodes=joint_config.candidate_pool_nodes,
+                max_pool_seqs=joint_config.candidate_pool_sequences,
+                max_tree_seqs=joint_config.max_verify_sequences,
+                max_tree_nodes=max_tree_nodes,
             )
-        )
+            lite_elapsed = _timer() - lite_start
+            stage_times["feature_mlp_select"] += lite_elapsed
+            current_overhead = lattice_elapsed + lite_elapsed
+            fallback_reason = None
+            use_ddtree_fallback = False
+            use_gpu_marginal_fallback = False
+            selection = SimpleNamespace(
+                metrics={
+                    "candidate_nodes": 0,
+                    "selected_nodes": selected_tree.num_nodes,
+                    "best_reach": 0.0,
+                    "mean_selected_reach": 0.0,
+                    "fallback_reason": "",
+                },
+            )
+            if ema_joint_overhead is None:
+                ema_joint_overhead = current_overhead
+            else:
+                ema_joint_overhead = 0.9 * ema_joint_overhead + 0.1 * current_overhead
+        else:
+            context_hidden = None
+            if joint_model.context_hidden_dim > 0:
+                context_hidden = target_hidden[:, -1, :]
+                if context_hidden.shape[-1] != joint_model.context_hidden_dim:
+                    raise ValueError(
+                        "Joint checkpoint context_hidden_dim does not match runtime target_hidden. "
+                        f"checkpoint={joint_model.context_hidden_dim}, runtime={context_hidden.shape[-1]}"
+                    )
+
+            pool_start = _timer()
+            value_token_scores = None
+            seed_score_elapsed = 0.0
+            if joint_config.candidate_pool_source == "ddtree_heap":
+                candidate_trie = build_ddtree_candidate_trie(draft_logits[0], joint_config.candidate_pool_nodes)
+            else:
+                if joint_config.enable_value_beam_pool:
+                    seed_nodes = max(1, int(joint_config.candidate_pool_nodes * min(joint_config.marginal_pool_fraction, 0.25)))
+                    seed_trie = build_marginal_candidate_trie(lattice, joint_config, max_nodes=seed_nodes)
+                    seed_score_start = _timer()
+                    seed_scores = score_candidate_trie(
+                        seed_trie,
+                        lattice,
+                        root_token_id=root_token[0, 0],
+                        model=joint_model,
+                        config=joint_config,
+                        prompt_length=start,
+                        context_hidden=context_hidden,
+                        calibration=calibration,
+                    )
+                    value_token_scores = value_token_scores_from_edges(lattice, seed_trie, seed_scores.edge_logits)
+                    seed_score_elapsed = _timer() - seed_score_start
+                    stage_times["feature_mlp_select"] += seed_score_elapsed
+                candidate_trie = build_union_candidate_trie(lattice, joint_config, value_token_scores=value_token_scores)
+            pool_elapsed = max(0.0, _timer() - pool_start - seed_score_elapsed)
+            stage_times["pool"] += pool_elapsed
+
+            select_start = _timer()
+            selection = select_joint_tree(
+                candidate_trie,
+                lattice,
+                root_token_id=root_token[0, 0],
+                model=joint_model,
+                config=joint_config,
+                prompt_length=start,
+                context_hidden=context_hidden,
+                calibration=calibration,
+            )
+            selected_tree = selection.selected_tree
+            fallback_reason = selection.fallback_reason
+            select_elapsed = _timer() - select_start
+            stage_times["feature_mlp_select"] += select_elapsed
+
+            current_overhead = lattice_elapsed + pool_elapsed + seed_score_elapsed + select_elapsed
+            if ema_joint_overhead is None:
+                ema_joint_overhead = current_overhead
+            else:
+                ema_joint_overhead = 0.9 * ema_joint_overhead + 0.1 * current_overhead
+            if (
+                ema_verify_time is not None
+                and len(acceptance_lengths) >= int(joint_config.latency_gate_warmup_rounds)
+                and ema_joint_overhead > float(joint_config.max_pool_build_overhead_ratio) * ema_verify_time
+            ):
+                fallback_reason = fallback_reason or "latency_gate_small_tree"
+
+            completed_rounds = max(1, len(acceptance_lengths))
+            fallback_rate_so_far = sum(fallback_counts.values()) / completed_rounds
+            cpu_fallback_rate_allowed = fallback_rate_so_far <= float(joint_config.max_fallback_rate)
+            use_ddtree_fallback = bool(
+                fallback_reason
+                and joint_config.fallback_to_ddtree
+                and cpu_fallback_rate_allowed
+                and (joint_config.fallback_backend == "cpu_ddtree" or joint_config.debug_force_cpu_heap)
+            )
+            use_gpu_marginal_fallback = bool(
+                fallback_reason
+                and joint_config.fallback_to_ddtree
+                and not use_ddtree_fallback
+                and (
+                    joint_config.fallback_backend == "gpu_marginal"
+                    or (joint_config.fallback_backend == "cpu_ddtree" and not cpu_fallback_rate_allowed)
+                )
+            )
         if use_ddtree_fallback:
             from ddtree import build_ddtree_tree, compile_ddtree_tree
 
             fallback_counts[fallback_reason] = fallback_counts.get(fallback_reason, 0) + 1
-            fallback_start = cuda_time()
+            fallback_start = _timer()
             node_token_ids, node_depths, parents, child_maps, visibility_cpu, _ = build_ddtree_tree(
                 draft_logits[0],
                 max_verify_nodes,
             )
-            stage_times["fallback"] += cuda_time() - fallback_start
+            stage_times["fallback"] += _timer() - fallback_start
 
-            tree_compile_start = cuda_time()
+            tree_compile_start = _timer()
             (
                 verify_input_ids,
                 verify_position_ids,
@@ -309,7 +357,7 @@ def joint_ddtree_generate(
                 previous_tree_start=previous_tree_start,
                 previous_tree_length=previous_tree_length,
             )
-            stage_times["tree_compile"] += cuda_time() - tree_compile_start
+            stage_times["tree_compile"] += _timer() - tree_compile_start
         else:
             if use_gpu_marginal_fallback:
                 fallback_counts[fallback_reason] = fallback_counts.get(fallback_reason, 0) + 1
@@ -319,10 +367,10 @@ def joint_ddtree_generate(
                     int(joint_config.latency_gate_small_tree_nodes),
                 )
                 fallback_config.min_verify_nodes = min(int(fallback_config.min_verify_nodes), int(fallback_config.max_verify_nodes))
-                selected_tree = select_marginal_tree(candidate_trie, fallback_config)
+                selected_tree = select_marginal_tree(candidate_trie, fallback_config, max_depth=lattice.horizon)
             if selected_tree.current_length > max_tree_nodes:
-                selected_tree = select_marginal_tree(candidate_trie, joint_config)
-            tree_compile_start = cuda_time()
+                selected_tree = select_marginal_tree(candidate_trie, joint_config, max_depth=lattice.horizon)
+            tree_compile_start = _timer()
             (
                 verify_input_ids,
                 verify_position_ids,
@@ -342,9 +390,9 @@ def joint_ddtree_generate(
                 previous_tree_start=previous_tree_start,
                 previous_tree_length=previous_tree_length,
             )
-            stage_times["tree_compile"] += cuda_time() - tree_compile_start
+            stage_times["tree_compile"] += _timer() - tree_compile_start
 
-        verify_stage_start = cuda_time()
+        verify_stage_start = _timer()
         output = target(
             verify_input_ids,
             position_ids=verify_position_ids,
@@ -353,34 +401,38 @@ def joint_ddtree_generate(
             use_cache=True,
             output_hidden_states=True,
         )
-        verify_elapsed = cuda_time() - verify_stage_start
+        verify_elapsed = _timer() - verify_stage_start
         stage_times["verify"] += verify_elapsed
         if ema_verify_time is None:
             ema_verify_time = verify_elapsed
         else:
             ema_verify_time = 0.9 * ema_verify_time + 0.1 * verify_elapsed
 
-        commit_stage_start = cuda_time()
+        commit_stage_start = _timer()
         posterior = sample(output.logits, temperature)
         if use_ddtree_fallback:
             from ddtree import follow_verified_tree
 
             accepted_indices, next_token = follow_verified_tree(child_maps, posterior)
+        elif selected_tree.child_maps is not None:
+            accepted_indices, next_token = follow_tree_cpu(selected_tree.child_maps, posterior)
         else:
             accepted_indices, next_token = follow_tree_tensorized(selected_tree, posterior)
-        accepted_index_tensor = torch.tensor(accepted_indices, dtype=torch.long, device=verify_input_ids.device)
+        n_accepted = len(accepted_indices)
+        _accepted_indices_buf[:n_accepted] = torch.as_tensor(accepted_indices, dtype=torch.long)
+        accepted_index_tensor = _accepted_indices_buf[:n_accepted]
         accepted_tokens = verify_input_ids.index_select(1, accepted_index_tensor)
 
-        output_ids[:, start : start + len(accepted_indices)] = accepted_tokens
-        output_ids[:, start + len(accepted_indices)] = next_token
+        output_ids[:, start : start + n_accepted] = accepted_tokens
+        output_ids[:, start + n_accepted] = next_token
 
-        compact_dynamic_cache(past_key_values_target, start, accepted_indices)
+        compact_dynamic_cache(past_key_values_target, start, accepted_index_tensor)
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids).index_select(1, accepted_index_tensor)
 
-        acceptance_lengths.append(len(accepted_indices))
-        start += len(accepted_indices)
-        stage_times["commit"] += cuda_time() - commit_stage_start
-        round_timestamps.append(cuda_time() - round_clock_start)
+        acceptance_lengths.append(n_accepted)
+        start += n_accepted
+        stage_times["commit"] += _timer() - commit_stage_start
+        round_timestamps.append(_timer() - round_clock_start)
         round_joint_metrics.append({
             **selection.metrics,
             "used_ddtree_fallback": use_ddtree_fallback,
@@ -389,12 +441,12 @@ def joint_ddtree_generate(
             "batch_max_verify_nodes": int(verify_input_ids.shape[1] - 1),
             "padded_verify_nodes": int(max_tree_nodes - 1),
             "effective_padded_node_count": int(verify_input_ids.shape[1] - 1),
-            "attention_mask_density": float((verify_attention_mask == 0).float().mean().item()),
+            "attention_mask_density": 0.0,  # skip expensive GPU sync in hot path
             "joint_overhead_time": float(current_overhead),
-            "seed_score_time": float(seed_score_elapsed),
+            "seed_score_time": float(seed_score_elapsed if not _is_taps_lite else 0.0),
             "ema_joint_overhead": float(ema_joint_overhead or 0.0),
             "ema_verify_time": float(ema_verify_time or 0.0),
-            "fallback_rate_so_far": float(fallback_rate_so_far),
+            "fallback_rate_so_far": float(fallback_rate_so_far if not _is_taps_lite else 0.0),
         })
 
         if save_tree_traces:
@@ -412,7 +464,7 @@ def joint_ddtree_generate(
             })
 
         if stop_token_ids_tensor is not None:
-            new_tokens = output_ids[:, start - len(accepted_indices) : start + 1]
+            new_tokens = output_ids[:, start - n_accepted : start + 1]
             if torch.isin(new_tokens[0], stop_token_ids_tensor).any():
                 break
 

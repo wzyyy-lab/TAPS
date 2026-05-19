@@ -59,8 +59,8 @@ class JointDDTConfig:
             raise ValueError("candidate_pool_nodes must be positive")
         if self.candidate_pool_sequences <= 0:
             raise ValueError("candidate_pool_sequences must be positive")
-        if self.candidate_pool_source not in {"union", "ddtree_heap"}:
-            raise ValueError("candidate_pool_source must be union or ddtree_heap")
+        if self.candidate_pool_source not in {"union", "ddtree_heap", "taps_lite"}:
+            raise ValueError("candidate_pool_source must be union, ddtree_heap, or taps_lite")
         if self.max_verify_nodes < 0:
             raise ValueError("max_verify_nodes must be non-negative")
         if self.min_verify_nodes < 0:

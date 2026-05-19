@@ -15,6 +15,7 @@ class SelectedTree:
     visibility: torch.Tensor
     old_to_new: torch.Tensor
     selected_old_node_ids: torch.Tensor
+    child_maps: list[dict[int, int]] | None = None
 
     @property
     def num_nodes(self) -> int:
@@ -47,7 +48,7 @@ def build_visibility_from_parents(parents: torch.Tensor, max_depth: int | None =
     return visibility
 
 
-def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor) -> SelectedTree:
+def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor, max_depth: int | None = None) -> SelectedTree:
     selected_mask = selected_mask.to(device=trie.device, dtype=torch.bool)
     if selected_mask.numel() != trie.num_nodes:
         raise ValueError("selected_mask must have one entry per non-root candidate node")
@@ -62,17 +63,22 @@ def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor) -> S
             visibility=torch.ones((1, 1), dtype=torch.bool, device=trie.device),
             old_to_new=torch.zeros((trie.num_total_nodes,), dtype=torch.long, device=trie.device),
             selected_old_node_ids=selected_old_node_ids,
+            child_maps=[{}],
         )
 
-    # Bulk transfer to CPU (single sync instead of per-node .item() calls)
-    selected_list = selected_old_node_ids.cpu().tolist()
-    parents_cpu = trie.parents.cpu().tolist()
-    token_ids_cpu = trie.token_ids.cpu().tolist()
+    # Single bulk CPU transfer (1 sync instead of 3)
+    _combined = torch.cat([selected_old_node_ids, trie.parents, trie.token_ids]).cpu()
+    n_sel = selected_old_node_ids.numel()
+    n_par = trie.num_total_nodes
+    selected_list = _combined[:n_sel].tolist()
+    parents_cpu = _combined[n_sel:n_sel + n_par].tolist()
+    token_ids_cpu = _combined[n_sel + n_par:].tolist()
 
-    # Deduplicate on CPU (no GPU syncs in the loop)
+    # Deduplicate on CPU + build child_maps for CPU tree walk
     old_to_new_cpu = {0: 0}
     edge_to_new: dict[tuple[int, int], int] = {}
     kept_old_nodes: list[int] = []
+    new_child_maps: list[dict[int, int]] = [{}]
     for old_node in selected_list:
         parent_old = parents_cpu[old_node]
         if parent_old not in old_to_new_cpu:
@@ -83,9 +89,12 @@ def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor) -> S
         if key in edge_to_new:
             old_to_new_cpu[old_node] = edge_to_new[key]
             continue
-        old_to_new_cpu[old_node] = len(kept_old_nodes) + 1
-        edge_to_new[key] = old_to_new_cpu[old_node]
+        new_idx = len(kept_old_nodes) + 1
+        old_to_new_cpu[old_node] = new_idx
+        edge_to_new[key] = new_idx
         kept_old_nodes.append(old_node)
+        new_child_maps.append({})
+        new_child_maps[parent_new][token] = new_idx
 
     selected_old_node_ids = torch.tensor(kept_old_nodes, dtype=torch.long, device=trie.device)
     if selected_old_node_ids.numel() == 0:
@@ -97,6 +106,7 @@ def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor) -> S
             visibility=torch.ones((1, 1), dtype=torch.bool, device=trie.device),
             old_to_new=torch.zeros((trie.num_total_nodes,), dtype=torch.long, device=trie.device),
             selected_old_node_ids=selected_old_node_ids,
+            child_maps=[{}],
         )
 
     old_to_new = torch.full((trie.num_total_nodes,), -1, dtype=torch.long, device=trie.device)
@@ -112,7 +122,8 @@ def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor) -> S
 
     parents = torch.cat([torch.tensor([-1], dtype=torch.long, device=trie.device), new_parents_nonroot], dim=0)
     depths = trie.depths[old_nonroot]
-    visibility = build_visibility_from_parents(parents, max_depth=int(depths.max().item()) if depths.numel() else 1)
+    _md = max_depth if max_depth is not None else (int(depths.max().item()) if depths.numel() else 1)
+    visibility = build_visibility_from_parents(parents, max_depth=_md)
     return SelectedTree(
         token_ids=trie.token_ids[old_nonroot],
         depths=depths,
@@ -120,6 +131,7 @@ def compact_selected_trie(trie: CandidateTrie, selected_mask: torch.Tensor) -> S
         visibility=visibility,
         old_to_new=old_to_new,
         selected_old_node_ids=selected_old_node_ids,
+        child_maps=new_child_maps,
     )
 
 
@@ -188,3 +200,19 @@ def follow_tree_tensorized(selected_tree: SelectedTree, posterior: torch.Tensor)
         accepted.append(int(current.item()))
         next_token = posterior[0, current]
     return accepted, int(next_token.item())
+
+
+def follow_tree_cpu(child_maps: list[dict[int, int]], posterior: torch.Tensor) -> tuple[list[int], int]:
+    """Walk verification tree on CPU. Single GPU->CPU transfer for posterior."""
+    posterior_cpu = posterior[0].cpu().tolist()
+    accepted = [0]
+    current = 0
+    next_token = posterior_cpu[current]
+    for _ in range(len(posterior_cpu)):
+        children = child_maps[current]
+        if next_token not in children:
+            return accepted, next_token
+        current = children[next_token]
+        accepted.append(current)
+        next_token = posterior_cpu[current]
+    return accepted, next_token
