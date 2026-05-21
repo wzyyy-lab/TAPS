@@ -62,54 +62,20 @@ The benchmark loader currently supports `aime25`, `gsm8k`, `humaneval`, `livecod
 
 ## Trace Sampling
 
-The TAPS checkpoint used for the reported results was trained from the following trace prompts. `--max-samples` selects dataset rows after shuffling. For single-turn datasets, one row is one prompt. For `mt-bench`, 40 selected rows expand to 80 prompts because each row has two turns.
+The TAPS checkpoint used for the reported results was trained from the following trace prompts (200 prompts per dataset, 800 total):
 
-| Dataset | Selected rows | Expanded prompts | Trace chunks passed to `--sample-offset/--max-samples` |
-|---|---:|---:|---|
-| `aime25` | 15 | 15 | `0/15` |
-| `gsm8k` | 64 | 64 | `0/16`, `16/16`, `32/16`, `48/16` |
-| `humaneval` | 64 | 64 | `0/16`, `16/16`, `32/16`, `48/16` |
-| `livecodebench` | 64 | 64 | `0/16`, `16/16`, `32/16`, `48/16` |
-| `math500` | 64 | 64 | `0/16`, `16/16`, `32/16`, `48/16` |
-| `mbpp` | 64 | 64 | `0/16`, `16/16`, `32/16`, `48/16` |
-| `mt-bench` | 40 | 80 | `0/16`, `16/16`, `32/8` |
+| Dataset | Prompts | Domain |
+|---|---:|---|
+| `alpaca` | 200 | Instruction |
+| `sharegpt` | 200 | Multi-turn chat |
+| `codealpaca` | 200 | Code |
+| `math` | 200 | Math reasoning |
 
-Create the trace job list:
+Collect traces:
 
 ```bash
-cat > "$RUN_DIR/trace_jobs.tsv" <<'EOF'
-aime25 0 15
-gsm8k 0 16
-gsm8k 16 16
-gsm8k 32 16
-gsm8k 48 16
-humaneval 0 16
-humaneval 16 16
-humaneval 32 16
-humaneval 48 16
-livecodebench 0 16
-livecodebench 16 16
-livecodebench 32 16
-livecodebench 48 16
-math500 0 16
-math500 16 16
-math500 32 16
-math500 48 16
-mbpp 0 16
-mbpp 16 16
-mbpp 32 16
-mbpp 48 16
-mt-bench 0 16
-mt-bench 16 16
-mt-bench 32 8
-EOF
-```
-
-Collect traces chunk by chunk:
-
-```bash
-while read -r DATASET OFFSET N; do
-  OUT="$RUN_DIR/traces/$DATASET/chunk_$OFFSET"
+for DATASET in alpaca sharegpt codealpaca math; do
+  OUT="$RUN_DIR/traces/$DATASET"
   mkdir -p "$OUT"
   python scripts/60_collect_joint_trace.py \
     --target-model "$TARGET_MODEL" \
@@ -119,52 +85,11 @@ while read -r DATASET OFFSET N; do
     --topk-collect 512 \
     --candidate-pool-nodes 512 \
     --candidate-pool-sequences 512 \
-    --max-samples "$N" \
-    --sample-offset "$OFFSET" \
+    --max-samples 200 \
     --shuffle-seed 2026 \
     --max-new-tokens 512 \
     --output "$OUT"
-done < "$RUN_DIR/trace_jobs.tsv"
-```
-
-## Train TAPS
-
-Train the node value model from the collected traces:
-
-```bash
-python scripts/61_train_node_value_net.py \
-  --traces "$RUN_DIR/traces" \
-  --output "$RUN_DIR/checkpoints" \
-  --target-model "$TARGET_MODEL" \
-  --runtime-topk 512 \
-  --epochs 30 \
-  --batch-size 4096 \
-  --grad-accum 1 \
-  --lr 1e-4 \
-  --weight-decay 0.01 \
-  --validation-fraction 0.05 \
-  --split-strategy stratified \
-  --reach-loss-weight 0.5 \
-  --rank-loss-weight 0.5 \
-  --rank-margin 0.05 \
-  --shuffle-seed 2026 \
-  --early-stop-patience 0
-
-export CKPT="$RUN_DIR/checkpoints/best.pt"
-```
-
-Optional offline selector evaluation:
-
-```bash
-python scripts/62_eval_joint_selector.py \
-  --traces "$RUN_DIR/traces" \
-  --checkpoint "$CKPT" \
-  --baseline ddtree_512 \
-  --target-accept-drop 0.03 \
-  --max-verify-nodes 64 \
-  --max-verify-sequences 64 \
-  --utility-thresholds 0,0.001,0.003,0.01 \
-  --output "$RUN_DIR/selector_eval.json"
+done
 ```
 
 ## Train TAPS-Lite
@@ -189,34 +114,6 @@ export TINY_CKPT="$RUN_DIR/tiny_scorer/best.pt"
 ## Run Benchmarks
 
 The examples below run on one held-out `gsm8k` chunk. Use the same `--dataset`, `--sample-offset`, `--max-samples`, and `--shuffle-seed` for all methods when comparing them.
-
-Run TAPS64:
-
-```bash
-python benchmark.py \
-  --model-name-or-path "$TARGET_MODEL" \
-  --draft-name-or-path "$DRAFT_MODEL" \
-  --dataset gsm8k \
-  --max-samples 16 \
-  --sample-offset 64 \
-  --shuffle-seed 2026 \
-  --max-new-tokens 512 \
-  --save-path "$RUN_DIR/taps64_gsm8k_offset64_n16.pt" \
-  --proposal-mode joint \
-  --tree-budget 512 \
-  --joint-checkpoint "$CKPT" \
-  --joint-topk 512 \
-  --candidate-pool-nodes 512 \
-  --candidate-pool-sequences 512 \
-  --candidate-pool-source ddtree_heap \
-  --min-verify-nodes 16 \
-  --max-verify-nodes 64 \
-  --min-verify-sequences 4 \
-  --max-verify-sequences 64 \
-  --no-fallback-to-ddtree \
-  --fallback-backend none \
-  --utility-threshold 0
-```
 
 Run TAPS-Lite:
 
